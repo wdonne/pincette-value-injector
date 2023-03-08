@@ -6,7 +6,8 @@ import static io.fabric8.kubernetes.client.dsl.base.PatchType.SERVER_SIDE_APPLY;
 import static io.javaoperatorsdk.operator.api.reconciler.DeleteControl.defaultDelete;
 import static io.javaoperatorsdk.operator.api.reconciler.UpdateControl.noUpdate;
 import static java.lang.Integer.MAX_VALUE;
-import static java.time.Duration.ofSeconds;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Base64.getDecoder;
 import static java.util.Optional.ofNullable;
 import static java.util.logging.Level.SEVERE;
 import static java.util.logging.Logger.getLogger;
@@ -30,7 +31,6 @@ import static net.pincette.util.StreamUtil.concat;
 import static net.pincette.util.StreamUtil.last;
 import static net.pincette.util.Util.splitPair;
 import static net.pincette.util.Util.tryToDo;
-import static net.pincette.util.Util.tryToDoForever;
 import static net.pincette.util.Util.tryToGet;
 import static net.pincette.util.Util.tryToGetRethrow;
 
@@ -38,7 +38,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.fabric8.kubernetes.api.model.GenericKubernetesResource;
 import io.fabric8.kubernetes.api.model.GenericKubernetesResourceList;
 import io.fabric8.kubernetes.api.model.ManagedFieldsEntry;
+import io.fabric8.kubernetes.client.Config;
+import io.fabric8.kubernetes.client.ConfigBuilder;
+import io.fabric8.kubernetes.client.ConfigFluentImpl;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientBuilder;
 import io.fabric8.kubernetes.client.Watch;
 import io.fabric8.kubernetes.client.Watcher;
 import io.fabric8.kubernetes.client.Watcher.Action;
@@ -55,7 +59,6 @@ import io.javaoperatorsdk.operator.api.reconciler.DeleteControl;
 import io.javaoperatorsdk.operator.api.reconciler.Reconciler;
 import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
 import io.javaoperatorsdk.operator.processing.retry.GradualRetry;
-import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -83,7 +86,10 @@ import net.pincette.vi.ValueInjectorSpec.ToReference;
 @io.javaoperatorsdk.operator.api.reconciler.ControllerConfiguration
 @GradualRetry(maxAttempts = MAX_VALUE)
 public class ValueInjectorReconciler implements Reconciler<ValueInjector>, Cleaner<ValueInjector> {
-  private static final Duration BACKOFF = ofSeconds(5);
+  private static final String CA = "ca";
+  private static final String CLIENT_CERT = "clientCert";
+  private static final String CLIENT_KEY = "clientKey";
+  private static final String CLIENT_KEY_ALGORITHM = "clientKeyAlgorithm";
   private static final String FIELD_MANAGER = "pincette.net/value-injector";
   private static final String FROM = "from";
   private static final Logger LOGGER = getLogger("net.pincette.vi");
@@ -123,12 +129,13 @@ public class ValueInjectorReconciler implements Reconciler<ValueInjector>, Clean
   private static BiConsumer<GenericKubernetesResource, GenericKubernetesResource> applyChange(
       final ValueInjector resource, final KubernetesClient client) {
     final DequePublisher<JsonObject> publisher = dequePublisher();
+    final KubernetesClient realClient = getClient(resource, client);
 
     with(publisher)
         .map(pipeline(resource))
         .map(json -> json.getJsonObject(TO))
         .get()
-        .subscribe(lambdaSubscriber(json -> apply(fromMongoDB(json), resource, client)));
+        .subscribe(lambdaSubscriber(json -> apply(fromMongoDB(json), resource, realClient)));
 
     return (from, to) -> {
       LOGGER.info(() -> "Received resource " + from);
@@ -142,7 +149,8 @@ public class ValueInjectorReconciler implements Reconciler<ValueInjector>, Clean
           .flatMap(
               json ->
                   createMessage(
-                          from, () -> to != null ? to : getResource(resource.getSpec().to, client))
+                          from,
+                          () -> to != null ? to : getResource(resource.getSpec().to, realClient))
                       .map(m -> pair(json, m)))
           .ifPresent(
               pair -> {
@@ -177,6 +185,10 @@ public class ValueInjectorReconciler implements Reconciler<ValueInjector>, Clean
                     createObjectBuilder().add(FROM, toJson(from)).add(TO, toJson(r)).build()));
   }
 
+  private static String decodeValue(final String encoded) {
+    return new String(getDecoder().decode(encoded), UTF_8);
+  }
+
   private static MixedOperation<
           GenericKubernetesResource,
           GenericKubernetesResourceList,
@@ -188,6 +200,39 @@ public class ValueInjectorReconciler implements Reconciler<ValueInjector>, Clean
           final KubernetesClient client) {
     return client.genericKubernetesResources(
         resourceDefinitionContext(kind, namespace, apiVersion));
+  }
+
+  private static KubernetesClient getClient(
+      final ValueInjector resource, final KubernetesClient client) {
+    return ofNullable(resource.getSpec().to.apiServer)
+        .flatMap(
+            a ->
+                ofNullable(resource.getSpec().to.secretRef)
+                    .map(
+                        ref -> client.secrets().inNamespace(ref.namespace).withName(ref.name).get())
+                    .map(s -> pair(a, s.getData())))
+        .map(
+            pair ->
+                new KubernetesClientBuilder()
+                    .withConfig(getClientConfig(pair.first, pair.second))
+                    .build())
+        .orElse(client);
+  }
+
+  private static Config getClientConfig(final String apiServer, final Map<String, String> secret) {
+    return ImmutableBuilder.create(ConfigBuilder::new)
+        .update(b -> b.withMasterUrl(apiServer))
+        .update(b -> b.withClientCertData(secret.get(CLIENT_CERT)))
+        .update(b -> b.withClientKeyData(secret.get(CLIENT_KEY)))
+        .update(ConfigFluentImpl::withDisableHostnameVerification)
+        .updateIf(
+            () ->
+                ofNullable(secret.get(CLIENT_KEY_ALGORITHM))
+                    .map(ValueInjectorReconciler::decodeValue),
+            ConfigFluentImpl::withClientKeyAlgo)
+        .updateIf(() -> ofNullable(secret.get(CA)), ConfigFluentImpl::withCaCertData)
+        .build()
+        .build();
   }
 
   private static GenericKubernetesResource getResource(
@@ -352,13 +397,12 @@ public class ValueInjectorReconciler implements Reconciler<ValueInjector>, Clean
       private boolean closed;
 
       public void eventReceived(final Action action, final T resource) {
-        tryToDoForever(
+        tryToDo(
             () -> {
               if (!closed) {
                 fn.accept(action, resource);
               }
             },
-            BACKOFF,
             ValueInjectorReconciler::logException);
       }
 
@@ -395,7 +439,7 @@ public class ValueInjectorReconciler implements Reconciler<ValueInjector>, Clean
 
       watchersTo.put(
           resource,
-          watchable(resource.getSpec().to, client)
+          watchable(resource.getSpec().to, getClient(resource, client))
               .watch(
                   watcher(
                       handleEvent(

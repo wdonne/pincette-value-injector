@@ -38,6 +38,45 @@ spec:
 
 In the `to` field the fields `kind` and `name` are mandatory. In the `from` field only the `kind` field is mandatory, which means that a collection of resources can be monitored. If any of them changes, that change will end up in the target resource.
 
+You can also inject values in a resource that lives in another Kubernetes cluster. In the `to` field you add the URL of the cluster in the `apiServer` field. The secret to access the cluster is referred to with the additional `secretRef` field, which has itself the `name` and `namespace` fields. The secret should have at least the fields `clientCert` and `clientKey`. Optionally it can also have the fields `ca` and `clientKeyAlgorithm`. The default value for the latter is `RSA`.
+
+The preceding example would look like this:
+
+```yaml
+apiVersion: pincette.net/v1
+kind: ValueInjector
+metadata:
+  name: my-cluster-secret-injector
+spec:
+  from:
+    name: vc-my-cluster
+    namespace: my-cluster
+    kind: Secret
+  to:
+    name: my-cluster-secret
+    namespace: argocd
+    kind: Secret
+    apiServer: https://my-cluster.my-cluster.svc
+    secretRef:
+      name: my-cluster-secret
+      namespace: default      
+  pipeline:
+    - $set:
+        to.data.config:
+          $replaceOne:
+            input:
+              $base64Decode: "$to.data.config"
+            find: "(KEY)"
+            replacement: "$from.data.client-key"
+    - $set:
+        to.data.config:
+          $base64Encode:
+            $replaceOne:
+              input: "$to.data.config"
+              find: "(CERTIFICATE)"
+              replacement: "$from.data.client-certificate"
+```
+
 If you use a GitOps tool make sure that the fields you change in the target resource are excluded from difference processing.
 
 Install the operator as follows:

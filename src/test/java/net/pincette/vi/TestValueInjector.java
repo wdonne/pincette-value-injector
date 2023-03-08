@@ -5,7 +5,6 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.Duration.ofMillis;
 import static java.time.Duration.ofSeconds;
 import static java.util.Base64.getDecoder;
-import static java.util.Base64.getEncoder;
 import static java.util.Optional.ofNullable;
 import static java.util.stream.Collectors.toList;
 import static net.pincette.json.Factory.a;
@@ -25,6 +24,7 @@ import io.fabric8.kubernetes.api.model.NamespaceBuilder;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.api.model.SecretBuilder;
+import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
 import io.fabric8.kubernetes.client.Watcher;
@@ -39,6 +39,7 @@ import javax.json.JsonValue;
 import net.pincette.json.Jackson;
 import net.pincette.json.JsonUtil;
 import net.pincette.vi.ValueInjectorSpec.FromReference;
+import net.pincette.vi.ValueInjectorSpec.SecretRef;
 import net.pincette.vi.ValueInjectorSpec.ToReference;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
@@ -49,8 +50,9 @@ import org.junit.jupiter.api.Test;
 
 // @EnableKubernetesMockClient(crud = true)
 class TestValueInjector {
+  private static final Config config = autoConfigure("play");
   private static final KubernetesClient client =
-      new KubernetesClientBuilder().withConfig(autoConfigure("play")).build();
+      new KubernetesClientBuilder().withConfig(config).build();
 
   private static CompletableFuture<Boolean> assertChange() {
     final CompletableFuture<Boolean> future = new CompletableFuture<>();
@@ -100,12 +102,20 @@ class TestValueInjector {
                 .create());
   }
 
+  private static void createPlaySecret() {
+    createSecret(
+        "play-secret",
+        "default",
+        map(
+            pair("clientCert", decodeValue(config.getClientCertData())),
+            pair("clientKey", decodeValue(config.getClientKeyData()))));
+  }
+
   private static Secret createSecret(final String name, final Map<String, String> fields) {
     return fields.entrySet().stream()
         .reduce(
             new SecretBuilder().withNewMetadata().withName(name).endMetadata(),
-            (b, e) ->
-                b.addToData(e.getKey(), getEncoder().encodeToString(e.getValue().getBytes(UTF_8))),
+            (b, e) -> b.addToStringData(e.getKey(), e.getValue()),
             (b1, b2) -> b1)
         .build();
   }
@@ -124,12 +134,22 @@ class TestValueInjector {
   }
 
   private static ToReference createToReference(
-      final String kind, final String name, final String namespace) {
+      final String kind, final String name, final String namespace, final boolean explicit) {
     final ToReference reference = new ToReference();
 
     reference.kind = kind;
     reference.name = name;
     reference.namespace = namespace;
+
+    if (explicit) {
+      reference.apiServer = config.getMasterUrl();
+
+      final SecretRef ref = new SecretRef();
+
+      ref.name = "play-secret";
+      ref.namespace = "default";
+      reference.secretRef = ref;
+    }
 
     return reference;
   }
@@ -161,6 +181,7 @@ class TestValueInjector {
     deleteCustomResource();
     deleteNamespace("ns1");
     deleteNamespace("ns2");
+    deleteSecret("play-secret", "default");
   }
 
   private static void deleteCustomResource() {
@@ -215,9 +236,11 @@ class TestValueInjector {
     deleteValueInjector("test");
     deleteSecret("secret1", "ns1");
     deleteSecret("secret2", "ns2");
+    deleteSecret("play-secret", "default");
     loadCustomResource();
     createNamespace("ns1");
     createNamespace("ns2");
+    createPlaySecret();
     startOperator();
   }
 
@@ -263,20 +286,26 @@ class TestValueInjector {
   @Test
   @DisplayName("any namespace")
   void anyNamespace() {
-    createAfter(null);
+    createAfter(null, false);
   }
 
   @Test
   @DisplayName("create after")
   void createAfter() {
-    createAfter("ns1");
+    createAfter("ns1", false);
   }
 
-  void createAfter(final String fromNamespace) {
-    valueInjector("secret1", fromNamespace);
+  void createAfter(final String fromNamespace, final boolean explicit) {
+    valueInjector("secret1", fromNamespace, explicit);
     createSecret("secret2", "ns2", map(pair("test1", "value2"), pair("test2", "value2")));
     createSecret("secret1", "ns1", map(pair("test1", "value1"), pair("test2", "value1")));
     assertChange().thenAccept(Assertions::assertTrue).join();
+  }
+
+  @Test
+  @DisplayName("create after explicit")
+  void createAfterExplicit() {
+    createAfter("ns1", true);
   }
 
   @Test
@@ -296,11 +325,16 @@ class TestValueInjector {
   }
 
   private static void valueInjector(final String fromName, final String fromNamespace) {
+    valueInjector(fromName, fromNamespace, false);
+  }
+
+  private static void valueInjector(
+      final String fromName, final String fromNamespace, final boolean explicit) {
     createValueInjector(
         createValueInjector(
             "test",
             createFromReference("Secret", fromName, fromNamespace),
-            createToReference("Secret", "secret2", "ns2"),
+            createToReference("Secret", "secret2", "ns2", explicit),
             a(
                 o(
                     f(

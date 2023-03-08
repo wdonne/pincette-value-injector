@@ -37,6 +37,8 @@ spec:
                   type: object
                 to:
                   properties:
+                    apiServer:
+                      type: string
                     apiVersion:
                       type: string
                     kind:
@@ -45,6 +47,16 @@ spec:
                       type: string
                     namespace:
                       type: string
+                    secretRef:
+                      properties:
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                      required:
+                        - name
+                        - namespace
+                      type: object
                   required:
                     - kind
                     - name

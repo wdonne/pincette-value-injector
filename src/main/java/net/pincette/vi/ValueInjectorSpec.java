@@ -60,9 +60,22 @@ public class ValueInjectorSpec {
     }
   }
 
+  public static class SecretRef {
+    @JsonProperty("name")
+    @Required
+    public String name;
+
+    @JsonProperty("namespace")
+    @Required
+    public String namespace;
+  }
+
   public static class ToReference {
     @JsonProperty("apiVersion")
     public String apiVersion = "v1";
+
+    @JsonProperty("apiServer")
+    public String apiServer;
 
     @JsonProperty("kind")
     @Required
@@ -75,6 +88,9 @@ public class ValueInjectorSpec {
     @JsonProperty("namespace")
     public String namespace;
 
+    @JsonProperty("secretRef")
+    public SecretRef secretRef;
+
     public String toString() {
       return "(apiVersion: "
           + apiVersion
@@ -84,6 +100,8 @@ public class ValueInjectorSpec {
           + name
           + ", namespace: "
           + namespace
+          + ", apiServer: "
+          + apiServer
           + ")";
     }
   }
