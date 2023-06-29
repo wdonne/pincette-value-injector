@@ -1,26 +1,27 @@
 package net.pincette.vi;
 
 import static io.fabric8.kubernetes.client.Config.autoConfigure;
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.Duration.ofMillis;
 import static java.time.Duration.ofSeconds;
 import static java.util.Base64.getDecoder;
 import static java.util.Optional.ofNullable;
-import static java.util.stream.Collectors.toList;
+import static net.pincette.io.StreamConnector.copy;
 import static net.pincette.json.Factory.a;
 import static net.pincette.json.Factory.f;
 import static net.pincette.json.Factory.o;
 import static net.pincette.json.Factory.v;
 import static net.pincette.json.JsonUtil.toNative;
+import static net.pincette.operator.testutil.Util.createNamespace;
+import static net.pincette.operator.testutil.Util.deleteAndWait;
+import static net.pincette.operator.testutil.Util.deleteNamespace;
 import static net.pincette.util.Collections.map;
 import static net.pincette.util.Pair.pair;
 import static net.pincette.util.ScheduledCompletionStage.runAsyncAfter;
 import static net.pincette.util.Util.doUntil;
-import static net.pincette.util.Util.tryToDoSilent;
-import static net.pincette.util.Util.tryToGet;
+import static net.pincette.util.Util.tryToDoRethrow;
 
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.fabric8.kubernetes.api.model.NamespaceBuilder;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.api.model.SecretBuilder;
@@ -29,15 +30,13 @@ import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
 import io.fabric8.kubernetes.client.Watcher;
 import io.fabric8.kubernetes.client.WatcherException;
-import io.fabric8.kubernetes.client.dsl.Resource;
 import io.javaoperatorsdk.operator.Operator;
-import java.util.List;
+import java.io.ByteArrayOutputStream;
+import java.io.FileInputStream;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import javax.json.JsonArray;
-import javax.json.JsonValue;
-import net.pincette.json.Jackson;
-import net.pincette.json.JsonUtil;
+import net.pincette.operator.testutil.Util;
 import net.pincette.vi.ValueInjectorSpec.FromReference;
 import net.pincette.vi.ValueInjectorSpec.SecretRef;
 import net.pincette.vi.ValueInjectorSpec.ToReference;
@@ -48,9 +47,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-// @EnableKubernetesMockClient(crud = true)
 class TestValueInjector {
-  private static final Config config = autoConfigure("play");
+  private static final String CLUSTER_SECRET = "cluster-secret";
+
+  private static final Config config = autoConfigure("minikube");
   private static final KubernetesClient client =
       new KubernetesClientBuilder().withConfig(config).build();
 
@@ -76,6 +76,25 @@ class TestValueInjector {
     return future;
   }
 
+  private static String clientCertData(final Config config) {
+    return ofNullable(config.getClientCertData())
+        .map(TestValueInjector::decodeValue)
+        .orElseGet(() -> readPemFile(config.getClientCertFile()));
+  }
+
+  private static String clientKeyData(final Config config) {
+    return ofNullable(config.getClientKeyData())
+        .map(TestValueInjector::decodeValue)
+        .orElseGet(() -> readPemFile(config.getClientKeyFile()));
+  }
+
+  private static void createClusterSecret() {
+    createSecret(
+        CLUSTER_SECRET,
+        "default",
+        map(pair("clientCert", clientCertData(config)), pair("clientKey", clientKeyData(config))));
+  }
+
   private static FromReference createFromReference(
       final String kind, final String name, final String namespace) {
     final FromReference reference = new FromReference();
@@ -85,30 +104,6 @@ class TestValueInjector {
     reference.namespace = namespace;
 
     return reference;
-  }
-
-  private static void createNamespace(final String name) {
-    tryToDoSilent(
-        () ->
-            client
-                .namespaces()
-                .resource(
-                    new NamespaceBuilder()
-                        .withApiVersion("v1")
-                        .withNewMetadata()
-                        .withName(name)
-                        .endMetadata()
-                        .build())
-                .create());
-  }
-
-  private static void createPlaySecret() {
-    createSecret(
-        "play-secret",
-        "default",
-        map(
-            pair("clientCert", decodeValue(config.getClientCertData())),
-            pair("clientKey", decodeValue(config.getClientKeyData()))));
   }
 
   private static Secret createSecret(final String name, final Map<String, String> fields) {
@@ -125,9 +120,9 @@ class TestValueInjector {
     final Secret secret = createSecret(name, fields);
 
     if (namespace != null) {
-      client.secrets().inNamespace(namespace).resource(secret).createOrReplace();
+      client.secrets().inNamespace(namespace).resource(secret).serverSideApply();
     } else {
-      client.secrets().resource(secret).createOrReplace();
+      client.secrets().resource(secret).serverSideApply();
     }
 
     waitForSecret(name, namespace, fields);
@@ -146,7 +141,7 @@ class TestValueInjector {
 
       final SecretRef ref = new SecretRef();
 
-      ref.name = "play-secret";
+      ref.name = CLUSTER_SECRET;
       ref.namespace = "default";
       reference.secretRef = ref;
     }
@@ -169,7 +164,7 @@ class TestValueInjector {
   }
 
   private static void createValueInjector(final ValueInjector valueInjector) {
-    client.resources(ValueInjector.class).resource(valueInjector).createOrReplace();
+    client.resources(ValueInjector.class).resource(valueInjector).serverSideApply();
   }
 
   private static String decodeValue(final String encoded) {
@@ -179,56 +174,42 @@ class TestValueInjector {
   @AfterAll
   public static void deleteAll() {
     deleteCustomResource();
-    deleteNamespace("ns1");
-    deleteNamespace("ns2");
-    deleteSecret("play-secret", "default");
+    deleteNamespace(client, "ns1");
+    deleteNamespace(client, "ns2");
+    deleteSecret(CLUSTER_SECRET, "default");
   }
 
   private static void deleteCustomResource() {
-    waitForDeleted(
-        client
-            .apiextensions()
-            .v1()
-            .customResourceDefinitions()
-            .withName("valueinjectors.pincette.net"));
-  }
-
-  private static void deleteNamespace(final String name) {
-    waitForDeleted(client.namespaces().withName(name));
-  }
-
-  private static void deleteValueInjector(final String name) {
-    waitForDeleted(client.resources(ValueInjector.class).withName(name));
+    Util.deleteCustomResource(client, "valueinjectors.pincette.net");
   }
 
   private static void deleteSecret(final String name, final String namespace) {
-    waitForDeleted(
+    deleteAndWait(
         namespace != null
             ? client.secrets().inNamespace(namespace).withName(name)
             : client.secrets().withName(name));
+  }
+
+  private static void deleteValueInjector(final String name) {
+    deleteAndWait(client.resources(ValueInjector.class).withName(name));
   }
 
   private static boolean hasFields(final Secret secret, final Map<String, String> fields) {
     return fields.entrySet().stream()
         .allMatch(
             e ->
-                ofNullable(secret.getData().get(e.getKey()))
+                ofNullable(secret)
+                    .map(s -> s.getData().get(e.getKey()))
                     .map(TestValueInjector::decodeValue)
                     .filter(v -> v.equals(e.getValue()))
                     .isPresent());
   }
 
   private static void loadCustomResource() {
-    tryToDoSilent(
-        () ->
-            client
-                .apiextensions()
-                .v1()
-                .customResourceDefinitions()
-                .load(
-                    ValueInjector.class.getResource(
-                        "/META-INF/fabric8/valueinjectors.pincette.net-v1.yml"))
-                .create());
+    Util.loadCustomResource(
+        client,
+        ValueInjector.class.getResourceAsStream(
+            "/META-INF/fabric8/valueinjectors.pincette.net-v1.yml"));
   }
 
   @BeforeAll
@@ -236,27 +217,20 @@ class TestValueInjector {
     deleteValueInjector("test");
     deleteSecret("secret1", "ns1");
     deleteSecret("secret2", "ns2");
-    deleteSecret("play-secret", "default");
+    deleteSecret(CLUSTER_SECRET, "default");
     loadCustomResource();
-    createNamespace("ns1");
-    createNamespace("ns2");
-    createPlaySecret();
+    createNamespace(client, "ns1");
+    createNamespace(client, "ns2");
+    createClusterSecret();
     startOperator();
   }
 
-  private static List<ObjectNode> toJackson(final JsonArray pipeline) {
-    return pipeline.stream()
-        .filter(JsonUtil::isObject)
-        .map(JsonValue::asJsonObject)
-        .map(Jackson::from)
-        .collect(toList());
-  }
+  private static String readPemFile(final String file) {
+    final ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-  private static <T> void waitForDeleted(final Resource<T> resource) {
-    resource.delete();
-    doUntil(
-        () -> tryToGet(() -> resource.fromServer().get() == null, e -> true).orElse(true),
-        ofMillis(100));
+    tryToDoRethrow(() -> copy(new FileInputStream(file), out));
+
+    return out.toString(US_ASCII);
   }
 
   private static void waitForSecret(
@@ -318,7 +292,7 @@ class TestValueInjector {
   }
 
   private static void startOperator() {
-    final Operator operator = new Operator(client);
+    final Operator operator = new Operator(overrider -> overrider.withKubernetesClient(client));
 
     operator.register(new ValueInjectorReconciler(client));
     operator.start();

@@ -9,7 +9,7 @@ import java.util.Objects;
 
 @Group("pincette.net")
 @Version("v1")
-public class ValueInjector extends CustomResource<ValueInjectorSpec, Object> {
+public class ValueInjector extends CustomResource<ValueInjectorSpec, ValueInjectorStatus> {
   @Override
   public boolean equals(Object o) {
     return this == o
