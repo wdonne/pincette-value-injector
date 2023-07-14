@@ -19,6 +19,7 @@ import static net.pincette.json.JsonUtil.string;
 import static net.pincette.mongo.Util.fromMongoDB;
 import static net.pincette.mongo.Util.toMongoDB;
 import static net.pincette.mongo.streams.Pipeline.create;
+import static net.pincette.operator.util.Status.READY;
 import static net.pincette.rs.Box.box;
 import static net.pincette.rs.Chain.with;
 import static net.pincette.rs.DequePublisher.dequePublisher;
@@ -34,7 +35,6 @@ import static net.pincette.util.StreamUtil.last;
 import static net.pincette.util.Util.splitPair;
 import static net.pincette.util.Util.tryToDo;
 import static net.pincette.util.Util.tryToGet;
-import static net.pincette.vi.Phase.Ready;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -75,10 +75,13 @@ import java.util.Set;
 import java.util.concurrent.Flow.Processor;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
 import javax.json.JsonObject;
 import javax.json.JsonValue;
+import net.pincette.operator.util.Status;
+import net.pincette.operator.util.Status.Condition;
 import net.pincette.rs.DequePublisher;
 import net.pincette.rs.PassThrough;
 import net.pincette.rs.streams.Message;
@@ -132,9 +135,14 @@ public class ValueInjectorReconciler
 
     tryToDo(
         () ->
-            genericClient(reference.kind, reference.namespace, reference.apiVersion, client)
-                .inNamespace(reference.namespace)
-                .withName(reference.name)
+            Util.with(
+                    () ->
+                        genericClient(
+                            reference.kind, reference.namespace, reference.apiVersion, client),
+                    c ->
+                        reference.namespace != null
+                            ? c.inNamespace(reference.namespace).withName(reference.name)
+                            : c.withName(reference.name))
                 .patch(PATCH_CONTEXT, asText),
         onError);
   }
@@ -372,20 +380,24 @@ public class ValueInjectorReconciler
         .build();
   }
 
+  private static Status status(final ValueInjector resource) {
+    return ofNullable(resource.getStatus()).orElseGet(Status::new);
+  }
+
   private static JsonObject toJson(final GenericKubernetesResource resource) {
     return to((ObjectNode) MAPPER.valueToTree(resource));
   }
 
   private static void updateStatus(
       final ValueInjector resource,
-      final ValueInjectorStatus status,
+      final Supplier<Condition> condition,
       final KubernetesClient client) {
     Util.with(
         () -> valueInjectorClient(client),
         c -> {
           final ValueInjector loaded = c.resource(resource).get();
 
-          loaded.setStatus(status);
+          loaded.setStatus(status(loaded).withCondition(condition.get()));
           c.resource(loaded).patchStatus();
 
           return loaded;
@@ -471,7 +483,7 @@ public class ValueInjectorReconciler
 
   private UpdateControl<ValueInjector> error(final ValueInjector resource, final String message) {
     retry(resource);
-    resource.setStatus(new ValueInjectorStatus(message));
+    resource.setStatus(status(resource).withError(message));
 
     return patchStatus(resource);
   }
@@ -493,7 +505,9 @@ public class ValueInjectorReconciler
                                 t -> applyChange.accept(fromRes, t),
                                 () -> {
                                   updateStatus(
-                                      resource, new ValueInjectorStatus(notExists(to)), client);
+                                      resource,
+                                      () -> new Condition().withError(notExists(to)),
+                                      client);
                                   retry(resource);
                                 })),
                 e -> retryAtException(resource, e)));
@@ -520,9 +534,9 @@ public class ValueInjectorReconciler
               resource.setStatus(
                   ofNullable(from.name)
                       .map(name -> runToSide(resource, applyChange))
-                      .orElseGet(ValueInjectorStatus::new));
+                      .orElseGet(Status::new));
 
-              if (resource.getStatus().phase != Ready) {
+              if (!READY.equals(resource.getStatus().phase)) {
                 retry(resource);
               }
 
@@ -545,11 +559,11 @@ public class ValueInjectorReconciler
 
   private void retryAtException(final ValueInjector resource, final Throwable t) {
     LOGGER.severe(t.getMessage());
-    updateStatus(resource, new ValueInjectorStatus(t.getMessage()), client);
+    updateStatus(resource, () -> new Condition().withException(t), client);
     retry(resource);
   }
 
-  private ValueInjectorStatus runToSide(
+  private Status runToSide(
       final ValueInjector resource,
       final BiConsumer<GenericKubernetesResource, GenericKubernetesResource> applyChange) {
     final FromReference from = resource.getSpec().from;
@@ -565,11 +579,11 @@ public class ValueInjectorReconciler
                       t -> {
                         applyChange.accept(f, t);
 
-                        return new ValueInjectorStatus();
+                        return status(resource).withCondition(new Condition());
                       })
-                  .orElseGet(() -> new ValueInjectorStatus(notExists(to)));
+                  .orElseGet(() -> status(resource).withError(notExists(to)));
             })
-        .orElseGet(() -> new ValueInjectorStatus(notExists(from)));
+        .orElseGet(() -> status(resource).withError(notExists(from)));
   }
 
   private Watch toWatcher(
@@ -590,7 +604,9 @@ public class ValueInjectorReconciler
                                 f -> applyChange.accept(f, toRes),
                                 () -> {
                                   updateStatus(
-                                      resource, new ValueInjectorStatus(notExists(from)), client);
+                                      resource,
+                                      () -> new Condition().withError(notExists(from)),
+                                      client);
                                   retry(resource);
                                 });
                       }
