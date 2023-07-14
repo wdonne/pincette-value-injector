@@ -16,7 +16,11 @@ spec:
     singular: valueinjector
   scope: Cluster
   versions:
-    - name: v1
+    - additionalPrinterColumns:
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+      name: v1
       schema:
         openAPIV3Schema:
           properties:
